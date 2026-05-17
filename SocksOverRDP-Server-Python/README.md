@@ -37,12 +37,3 @@ Useful options:
 python .\server.py -v -d
 python .\server.py --connect-timeout 5
 ```
-
-## Notes
-
-The original C++ project is intentionally untouched. This folder is a parallel
-implementation target so we can iterate without disturbing the Visual Studio
-baseline.
-
-The implementation has been syntax and protocol-helper checked locally, but it
-still needs live validation against an RDP session with the existing plugin.
