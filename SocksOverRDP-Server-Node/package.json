@@ -1,0 +1,20 @@
+{
+  "name": "socksoverrdp-server-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental Node.js server-side port of SocksOverRDP.",
+  "type": "commonjs",
+  "scripts": {
+    "check": "node --check server.js",
+    "test:helpers": "node -e \"const s=require('./server'); const data=s.encodeFrame({connectionId:1,payload:Buffer.from('ok'),close:true}); const out=s.decodeFrames(data); if(out.frames.length!==1||out.leftover.length||!out.frames[0].close) process.exit(1);\"",
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ffi-napi": "^4.0.3",
+    "ref-napi": "^3.0.3",
+    "ref-struct-di": "^1.1.1"
+  }
+}
