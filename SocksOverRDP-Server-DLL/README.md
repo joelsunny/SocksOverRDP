@@ -60,6 +60,7 @@ VOID CALLBACK Rundll32Start(HWND hwnd, HINSTANCE hinst, LPSTR cmdLine, INT nCmdS
 -d, --debug
 --priority N
 --connect-timeout SECONDS
+--log PATH
 ```
 
 ## Usage
@@ -76,6 +77,18 @@ C:\Windows\System32\rundll32.exe .\SocksOverRDP-Server-DLL.dll,Rundll32Start -v
 ```
 
 For a 32-bit DLL build, use `C:\Windows\SysWOW64\rundll32.exe` instead.
+
+The DLL writes a diagnostic log to the DLL folder by default:
+
+```text
+.\SocksOverRDP-Server-DLL.log
+```
+
+To choose the path when using `rundll32`, pass `--log`:
+
+```powershell
+C:\Windows\System32\rundll32.exe .\SocksOverRDP-Server-DLL.dll,Rundll32Start -v -d --log=C:\Temp\SocksOverRDP-Server-DLL.log
+```
 
 When the channel opens successfully, the SOCKS listener is created by the
 client-side plugin, normally on `127.0.0.1:1080`, just like the original server

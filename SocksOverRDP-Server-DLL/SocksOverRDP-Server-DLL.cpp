@@ -15,6 +15,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -48,6 +49,7 @@ struct Options
 	bool debug = false;
 	DWORD priority = kDefaultPriority;
 	DWORD connectTimeoutMs = kDefaultConnectTimeoutMs;
+	std::wstring logPath;
 };
 
 struct Frame
@@ -57,10 +59,76 @@ struct Frame
 	bool close = false;
 };
 
+enum class SocksAddressReadResult
+{
+	Ok,
+	ProtocolError,
+	RemoteClosed
+};
+
 class SocksOverRdpServer;
 
 std::mutex g_serverMutex;
 SocksOverRdpServer *g_server = nullptr;
+std::mutex g_logMutex;
+FILE *g_logFile = nullptr;
+HMODULE g_module = nullptr;
+
+std::wstring DefaultLogPath()
+{
+	wchar_t modulePath[MAX_PATH] = {};
+	DWORD length = GetModuleFileNameW(g_module, modulePath, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH)
+	{
+		return L"SocksOverRDP-Server-DLL.log";
+	}
+
+	std::wstring path(modulePath, length);
+	size_t separator = path.find_last_of(L"\\/");
+	if (separator == std::wstring::npos)
+	{
+		return L"SocksOverRDP-Server-DLL.log";
+	}
+
+	return path.substr(0, separator + 1) + L"SocksOverRDP-Server-DLL.log";
+}
+
+void OpenLogFile(const std::wstring &path)
+{
+	std::lock_guard<std::mutex> lock(g_logMutex);
+	if (g_logFile)
+	{
+		fclose(g_logFile);
+		g_logFile = nullptr;
+	}
+
+	_wfopen_s(&g_logFile, path.c_str(), L"a, ccs=UTF-8");
+	if (g_logFile)
+	{
+		SYSTEMTIME now = {};
+		GetLocalTime(&now);
+		fwprintf(
+			g_logFile,
+			L"\n[%04u-%02u-%02u %02u:%02u:%02u] SocksOverRDP DLL server log opened\n",
+			now.wYear,
+			now.wMonth,
+			now.wDay,
+			now.wHour,
+			now.wMinute,
+			now.wSecond);
+		fflush(g_logFile);
+	}
+}
+
+void CloseLogFile()
+{
+	std::lock_guard<std::mutex> lock(g_logMutex);
+	if (g_logFile)
+	{
+		fclose(g_logFile);
+		g_logFile = nullptr;
+	}
+}
 
 void DebugLine(const wchar_t *prefix, const std::wstring &message)
 {
@@ -69,6 +137,22 @@ void DebugLine(const wchar_t *prefix, const std::wstring &message)
 	line += L"\n";
 	OutputDebugStringW(line.c_str());
 	fwprintf(stderr, L"%ls", line.c_str());
+
+	std::lock_guard<std::mutex> lock(g_logMutex);
+	if (g_logFile)
+	{
+		SYSTEMTIME now = {};
+		GetLocalTime(&now);
+		fwprintf(
+			g_logFile,
+			L"[%02u:%02u:%02u.%03u] %ls",
+			now.wHour,
+			now.wMinute,
+			now.wSecond,
+			now.wMilliseconds,
+			line.c_str());
+		fflush(g_logFile);
+	}
 }
 
 void LogLine(bool enabled, const wchar_t *prefix, const std::wstring &message)
@@ -629,7 +713,7 @@ private:
 	void Run();
 	SOCKET HandleSocks4();
 	SOCKET HandleSocks5();
-	bool ReadSocks5Address(BYTE addressType, std::string &host, WORD &port);
+	SocksAddressReadResult ReadSocks5Address(BYTE addressType, std::string &host, WORD &port);
 	SOCKET ConnectTarget(const std::string &host, WORD port);
 	bool SendAll(SOCKET socketHandle, const std::vector<char> &payload);
 	void Relay(SOCKET socketHandle);
@@ -659,6 +743,7 @@ public:
 
 	INT Serve()
 	{
+		LogLine(true, L"[*] ", L"Starting server loop");
 		DWORD err = channel_.Open();
 		if (err != ERROR_SUCCESS)
 		{
@@ -690,6 +775,7 @@ public:
 			DispatchCompleteFrames(pending);
 		}
 
+		LogLine(true, L"[*] ", L"Server loop exiting");
 		Shutdown();
 		return 0;
 	}
@@ -701,6 +787,7 @@ public:
 			return;
 		}
 
+		LogLine(true, L"[*] ", L"Shutdown requested");
 		channel_.Close();
 
 		std::vector<std::shared_ptr<ProxyConnection>> connections;
@@ -779,7 +866,7 @@ public:
 		if (found != connections_.end() && found->second.get() == connection)
 		{
 			connections_.erase(found);
-			Debug(HexId(connectionId) + L": connection worker removed");
+			Debug(HexId(connectionId) + L": connection worker removed; active=" + std::to_wstring(connections_.size()));
 		}
 	}
 
@@ -847,7 +934,7 @@ private:
 				connection = std::make_shared<ProxyConnection>(*this, frame.connectionId);
 				connections_[frame.connectionId] = connection;
 				connection->Start();
-				Debug(HexId(frame.connectionId) + L": connection worker started");
+				Debug(HexId(frame.connectionId) + L": connection worker started; active=" + std::to_wstring(connections_.size()));
 			}
 			else
 			{
@@ -901,10 +988,18 @@ void ProxyConnection::Stop()
 
 void ProxyConnection::Join()
 {
-	if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
+	if (!worker_.joinable())
 	{
-		worker_.join();
+		return;
 	}
+
+	if (worker_.get_id() == std::this_thread::get_id())
+	{
+		worker_.detach();
+		return;
+	}
+
+	worker_.join();
 }
 
 void ProxyConnection::Run()
@@ -953,8 +1048,7 @@ SOCKET ProxyConnection::HandleSocks4()
 		!input_.ReadExact(4, rawIp) ||
 		!input_.ReadUntilNull(kBufferSize, ignoredUserId))
 	{
-		server_.Debug(HexId(connectionId_) + L": malformed SOCKS4 request");
-		Send(Socks4Reply(0x5B), true);
+		server_.Debug(HexId(connectionId_) + L": SOCKS4 stream closed during negotiation");
 		return INVALID_SOCKET;
 	}
 
@@ -965,8 +1059,7 @@ SOCKET ProxyConnection::HandleSocks4()
 		std::vector<char> domain;
 		if (!input_.ReadUntilNull(kBufferSize, domain))
 		{
-			server_.Debug(HexId(connectionId_) + L": malformed SOCKS4a domain");
-			Send(Socks4Reply(0x5B), true);
+			server_.Debug(HexId(connectionId_) + L": SOCKS4a stream closed during domain read");
 			return INVALID_SOCKET;
 		}
 		host = BytesToString(domain);
@@ -1026,7 +1119,6 @@ SOCKET ProxyConnection::HandleSocks5()
 	if (!input_.ReadExact(4, header))
 	{
 		server_.Debug(HexId(connectionId_) + L": incomplete SOCKS5 request header");
-		Send(Socks5Reply(0x01), true);
 		return INVALID_SOCKET;
 	}
 
@@ -1043,9 +1135,13 @@ SOCKET ProxyConnection::HandleSocks5()
 
 	std::string host;
 	WORD port = 0;
-	if (!ReadSocks5Address(addressType, host, port))
+	SocksAddressReadResult addressResult = ReadSocks5Address(addressType, host, port);
+	if (addressResult != SocksAddressReadResult::Ok)
 	{
-		Send(Socks5Reply(0x08), true);
+		if (addressResult == SocksAddressReadResult::ProtocolError)
+		{
+			Send(Socks5Reply(0x08), true);
+		}
 		return INVALID_SOCKET;
 	}
 
@@ -1069,7 +1165,7 @@ SOCKET ProxyConnection::HandleSocks5()
 	return relaySocket;
 }
 
-bool ProxyConnection::ReadSocks5Address(BYTE addressType, std::string &host, WORD &port)
+SocksAddressReadResult ProxyConnection::ReadSocks5Address(BYTE addressType, std::string &host, WORD &port)
 {
 	std::vector<char> rawAddress;
 	std::vector<char> rawPort;
@@ -1079,7 +1175,8 @@ bool ProxyConnection::ReadSocks5Address(BYTE addressType, std::string &host, WOR
 	{
 		if (!input_.ReadExact(4, rawAddress) || !input_.ReadExact(2, rawPort))
 		{
-			return false;
+			server_.Debug(HexId(connectionId_) + L": SOCKS5 IPv4 address read closed");
+			return SocksAddressReadResult::RemoteClosed;
 		}
 		inet_ntop(AF_INET, rawAddress.data(), text, sizeof(text));
 		host = text;
@@ -1089,13 +1186,20 @@ bool ProxyConnection::ReadSocks5Address(BYTE addressType, std::string &host, WOR
 		std::vector<char> lengthBytes;
 		if (!input_.ReadExact(1, lengthBytes))
 		{
-			return false;
+			server_.Debug(HexId(connectionId_) + L": SOCKS5 domain length read closed");
+			return SocksAddressReadResult::RemoteClosed;
 		}
 
 		BYTE length = static_cast<BYTE>(lengthBytes[0]);
-		if (length == 0 || !input_.ReadExact(length, rawAddress) || !input_.ReadExact(2, rawPort))
+		if (length == 0)
 		{
-			return false;
+			server_.Debug(HexId(connectionId_) + L": empty SOCKS5 domain name");
+			return SocksAddressReadResult::ProtocolError;
+		}
+		if (!input_.ReadExact(length, rawAddress) || !input_.ReadExact(2, rawPort))
+		{
+			server_.Debug(HexId(connectionId_) + L": SOCKS5 domain read closed");
+			return SocksAddressReadResult::RemoteClosed;
 		}
 		host = BytesToString(rawAddress);
 	}
@@ -1103,7 +1207,8 @@ bool ProxyConnection::ReadSocks5Address(BYTE addressType, std::string &host, WOR
 	{
 		if (!input_.ReadExact(16, rawAddress) || !input_.ReadExact(2, rawPort))
 		{
-			return false;
+			server_.Debug(HexId(connectionId_) + L": SOCKS5 IPv6 address read closed");
+			return SocksAddressReadResult::RemoteClosed;
 		}
 		inet_ntop(AF_INET6, rawAddress.data(), text, sizeof(text));
 		host = text;
@@ -1111,11 +1216,11 @@ bool ProxyConnection::ReadSocks5Address(BYTE addressType, std::string &host, WOR
 	else
 	{
 		server_.Debug(HexId(connectionId_) + L": unsupported SOCKS5 address type");
-		return false;
+		return SocksAddressReadResult::ProtocolError;
 	}
 
 	port = ReadUInt16Be(rawPort, 0);
-	return true;
+	return SocksAddressReadResult::Ok;
 }
 
 SOCKET ProxyConnection::ConnectTarget(const std::string &host, WORD port)
@@ -1214,7 +1319,7 @@ bool ProxyConnection::SendAll(SOCKET socketHandle, const std::vector<char> &payl
 			0);
 		if (rc == SOCKET_ERROR || rc == 0)
 		{
-			server_.Debug(HexId(connectionId_) + L": send target failed");
+			server_.Debug(HexId(connectionId_) + L": send target failed: " + std::to_wstring(WSAGetLastError()));
 			return false;
 		}
 		sent += static_cast<size_t>(rc);
@@ -1271,7 +1376,14 @@ void ProxyConnection::RelayTargetToClient(SOCKET socketHandle)
 
 		if (!stopping_.exchange(true))
 		{
-			server_.Debug(HexId(connectionId_) + L": target side closed");
+			if (rc == SOCKET_ERROR)
+			{
+				server_.Debug(HexId(connectionId_) + L": target recv failed: " + std::to_wstring(WSAGetLastError()));
+			}
+			else
+			{
+				server_.Debug(HexId(connectionId_) + L": target side closed");
+			}
 			Send({}, true);
 			sentClose = true;
 		}
@@ -1337,6 +1449,10 @@ Options ParseOptions(INT argc, WCHAR **argv)
 				options.connectTimeoutMs = static_cast<DWORD>(seconds * 1000.0);
 			}
 		}
+		else if (_wcsicmp(argv[i], L"--log") == 0 && i + 1 < argc)
+		{
+			options.logPath = argv[++i];
+		}
 	}
 	return options;
 }
@@ -1358,24 +1474,55 @@ Options ParseRundllOptions(LPSTR cmdLine)
 	{
 		options.debug = true;
 	}
+
+	std::istringstream stream(args);
+	std::string token;
+	while (stream >> token)
+	{
+		if (token == "--log")
+		{
+			std::string path;
+			if (stream >> path)
+			{
+				options.logPath = ToWide(path);
+			}
+		}
+		else if (token.rfind("--log=", 0) == 0)
+		{
+			options.logPath = ToWide(token.substr(6));
+		}
+	}
 	return options;
 }
 
 INT RunWithOptions(const Options &options)
 {
+	Options effectiveOptions = options;
+	if (effectiveOptions.logPath.empty())
+	{
+		effectiveOptions.logPath = DefaultLogPath();
+	}
+
+	OpenLogFile(effectiveOptions.logPath);
+	LogLine(true, L"[*] ", L"Log file: " + effectiveOptions.logPath);
+
 	WSADATA wsaData = {};
 	int wsa = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (wsa != 0)
 	{
+		LogLine(true, L"[-] ", L"WSAStartup failed: " + std::to_wstring(wsa));
+		CloseLogFile();
 		return wsa;
 	}
 
-	SocksOverRdpServer server(options);
+	SocksOverRdpServer server(effectiveOptions);
 	{
 		std::lock_guard<std::mutex> lock(g_serverMutex);
 		if (g_server != nullptr)
 		{
 			WSACleanup();
+			LogLine(true, L"[-] ", L"Server already running");
+			CloseLogFile();
 			return ERROR_BUSY;
 		}
 		g_server = &server;
@@ -1392,6 +1539,8 @@ INT RunWithOptions(const Options &options)
 	}
 
 	WSACleanup();
+	LogLine(true, L"[*] ", L"Server stopped with result " + std::to_wstring(result));
+	CloseLogFile();
 	return result;
 }
 }
@@ -1440,6 +1589,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
 	if (reason == DLL_PROCESS_ATTACH)
 	{
+		g_module = module;
 		DisableThreadLibraryCalls(module);
 	}
 	return TRUE;
