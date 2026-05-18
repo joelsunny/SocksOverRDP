@@ -25,7 +25,7 @@ Like the original server, BIND and UDP ASSOCIATE are not implemented.
 ## Setup
 
 Node cannot call the Windows Terminal Services API by itself, so this port uses
-FFI packages:
+Koffi for Win32 FFI:
 
 ```powershell
 cd .\SocksOverRDP-Server-Node
@@ -55,5 +55,5 @@ npm run check
 npm run test:helpers
 ```
 
-The protocol helpers are testable without FFI installed. Opening the RDP
+The protocol helpers are testable without Koffi installed. Opening the RDP
 channel requires `npm install` and an active RDP session with the plugin loaded.

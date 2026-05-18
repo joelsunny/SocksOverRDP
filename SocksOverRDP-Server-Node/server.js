@@ -76,58 +76,64 @@ function ipv4FromBuffer(buffer) {
 }
 
 function loadWin32Ffi() {
-  let ffi;
-  let ref;
-  let Struct;
+  let koffi;
 
   try {
-    ffi = require("ffi-napi");
-    ref = require("ref-napi");
-    Struct = require("ref-struct-di")(ref);
+    koffi = require("koffi");
   } catch (error) {
     if (error.code === "MODULE_NOT_FOUND") {
       throw new Error(
-        "The Node server requires ffi-napi, ref-napi, and ref-struct-di. " +
+        "The Node server requires koffi. " +
           "Run `npm install` in SocksOverRDP-Server-Node before starting the server."
       );
     }
     throw error;
   }
 
-  const voidPtr = ref.refType(ref.types.void);
-  const uint32Ptr = ref.refType(ref.types.uint32);
-
-  const OVERLAPPED = Struct({
-    Internal: ref.types.size_t,
-    InternalHigh: ref.types.size_t,
-    Offset: ref.types.uint32,
-    OffsetHigh: ref.types.uint32,
-    hEvent: voidPtr
+  const HANDLE = koffi.pointer("HANDLE", koffi.opaque());
+  const DWORD = koffi.alias("DWORD", "uint32_t");
+  const OVERLAPPED = koffi.struct("OVERLAPPED", {
+    Internal: "uintptr_t",
+    InternalHigh: "uintptr_t",
+    Offset: DWORD,
+    OffsetHigh: DWORD,
+    hEvent: HANDLE
   });
 
-  const overlappedPtr = ref.refType(OVERLAPPED);
-  const voidPtrPtr = ref.refType(voidPtr);
+  const kernel32 = koffi.load("kernel32.dll");
+  const wtsapi32 = koffi.load("wtsapi32.dll");
 
-  const kernel32 = ffi.Library("kernel32", {
-    GetLastError: ["uint32", []],
-    GetCurrentProcess: [voidPtr, []],
-    DuplicateHandle: ["int", [voidPtr, voidPtr, voidPtr, voidPtrPtr, "uint32", "int", "uint32"]],
-    CreateEventW: [voidPtr, [voidPtr, "int", "int", voidPtr]],
-    WaitForSingleObject: ["uint32", [voidPtr, "uint32"]],
-    GetOverlappedResult: ["int", [voidPtr, overlappedPtr, uint32Ptr, "int"]],
-    ReadFile: ["int", [voidPtr, "pointer", "uint32", uint32Ptr, overlappedPtr]],
-    WriteFile: ["int", [voidPtr, "pointer", "uint32", uint32Ptr, overlappedPtr]],
-    CloseHandle: ["int", [voidPtr]]
-  });
-
-  const wtsapi32 = ffi.Library("wtsapi32", {
-    WTSVirtualChannelOpenEx: [voidPtr, ["uint32", "string", "uint32"]],
-    WTSVirtualChannelQuery: ["int", [voidPtr, "int", voidPtrPtr, uint32Ptr]],
-    WTSVirtualChannelClose: ["int", [voidPtr]],
-    WTSFreeMemory: ["void", [voidPtr]]
-  });
-
-  return { ffi, ref, voidPtr, uint32Ptr, OVERLAPPED, kernel32, wtsapi32 };
+  return {
+    koffi,
+    HANDLE,
+    DWORD,
+    OVERLAPPED,
+    kernel32: {
+      GetLastError: kernel32.func("DWORD __stdcall GetLastError(void)"),
+      GetCurrentProcess: kernel32.func("HANDLE __stdcall GetCurrentProcess(void)"),
+      DuplicateHandle: kernel32.func(
+        "int __stdcall DuplicateHandle(HANDLE, HANDLE, HANDLE, _Out_ HANDLE *, DWORD, int, DWORD)"
+      ),
+      CreateEventW: kernel32.func("HANDLE __stdcall CreateEventW(void *, int, int, void *)"),
+      WaitForSingleObject: kernel32.func("DWORD __stdcall WaitForSingleObject(HANDLE, DWORD)"),
+      GetOverlappedResult: kernel32.func(
+        "int __stdcall GetOverlappedResult(HANDLE, _Inout_ OVERLAPPED *, _Out_ DWORD *, int)"
+      ),
+      ReadFile: kernel32.func("int __stdcall ReadFile(HANDLE, _Out_ void *, DWORD, _Out_ DWORD *, _Inout_ OVERLAPPED *)"),
+      WriteFile: kernel32.func(
+        "int __stdcall WriteFile(HANDLE, const void *, DWORD, _Out_ DWORD *, _Inout_ OVERLAPPED *)"
+      ),
+      CloseHandle: kernel32.func("int __stdcall CloseHandle(HANDLE)")
+    },
+    wtsapi32: {
+      WTSVirtualChannelOpenEx: wtsapi32.func("HANDLE __stdcall WTSVirtualChannelOpenEx(DWORD, const char *, DWORD)"),
+      WTSVirtualChannelQuery: wtsapi32.func(
+        "int __stdcall WTSVirtualChannelQuery(HANDLE, int, _Out_ void **, _Out_ DWORD *)"
+      ),
+      WTSVirtualChannelClose: wtsapi32.func("int __stdcall WTSVirtualChannelClose(HANDLE)"),
+      WTSFreeMemory: wtsapi32.func("void __stdcall WTSFreeMemory(void *)")
+    }
+  };
 }
 
 class RdpVirtualChannel {
@@ -147,8 +153,8 @@ class RdpVirtualChannel {
   }
 
   _isNullPointer(pointer) {
-    const { ref } = this._load();
-    return !pointer || ref.isNull(pointer);
+    const { koffi } = this._load();
+    return pointer == null || koffi.address(pointer) === 0n;
   }
 
   _lastError(operation) {
@@ -158,7 +164,7 @@ class RdpVirtualChannel {
   }
 
   async open() {
-    const { ref, voidPtr, kernel32, wtsapi32 } = this._load();
+    const { koffi, HANDLE, kernel32, wtsapi32 } = this._load();
     const flags = WTS_CHANNEL_OPTION_DYNAMIC | this.priority;
     const wtsHandle = wtsapi32.WTSVirtualChannelOpenEx(WTS_CURRENT_SESSION, this.channelName, flags);
 
@@ -167,8 +173,8 @@ class RdpVirtualChannel {
     }
     this.wtsHandle = wtsHandle;
 
-    const fileHandleMemoryPtr = ref.alloc(voidPtr);
-    const lengthPtr = ref.alloc(ref.types.uint32);
+    const fileHandleMemoryPtr = [null];
+    const lengthPtr = [0];
     const ok = wtsapi32.WTSVirtualChannelQuery(
       this.wtsHandle,
       WTS_VIRTUAL_FILE_HANDLE,
@@ -179,14 +185,14 @@ class RdpVirtualChannel {
       throw this._lastError("WTSVirtualChannelQuery");
     }
 
-    const fileHandleMemory = fileHandleMemoryPtr.deref();
+    const fileHandleMemory = fileHandleMemoryPtr[0];
     try {
-      if (lengthPtr.deref() !== ref.sizeof.pointer) {
-        throw new Error(`unexpected virtual file handle size ${lengthPtr.deref()}`);
+      if (lengthPtr[0] !== koffi.sizeof(HANDLE)) {
+        throw new Error(`unexpected virtual file handle size ${lengthPtr[0]}`);
       }
 
-      const sourceHandle = ref.get(fileHandleMemory, 0, voidPtr);
-      const duplicatedPtr = ref.alloc(voidPtr);
+      const sourceHandle = koffi.decode(fileHandleMemory, HANDLE);
+      const duplicatedPtr = [null];
       const currentProcess = kernel32.GetCurrentProcess();
       const duplicated = kernel32.DuplicateHandle(
         currentProcess,
@@ -200,7 +206,7 @@ class RdpVirtualChannel {
       if (!duplicated) {
         throw this._lastError("DuplicateHandle");
       }
-      this.fileHandle = duplicatedPtr.deref();
+      this.fileHandle = duplicatedPtr[0];
     } finally {
       if (!this._isNullPointer(fileHandleMemory)) {
         wtsapi32.WTSFreeMemory(fileHandleMemory);
@@ -232,34 +238,34 @@ class RdpVirtualChannel {
   }
 
   async _readFileOnce(size) {
-    const { ref, kernel32, OVERLAPPED } = this._load();
-    const buffer = Buffer.alloc(size);
-    const transferredPtr = ref.alloc(ref.types.uint32);
-    const overlapped = new OVERLAPPED();
+    const { koffi, DWORD, kernel32, OVERLAPPED } = this._load();
+    const buffer = koffi.alloc("uint8_t", size);
+    const transferredPtr = this._allocStable(DWORD, 0);
+    const overlapped = this._allocOverlapped();
     const event = this._createEvent("ReadFile");
-    overlapped.hEvent = event;
+    this._writeOverlapped(overlapped, event);
 
     try {
-      const ok = kernel32.ReadFile(this.fileHandle, buffer, size, transferredPtr, overlapped.ref());
+      const ok = kernel32.ReadFile(this.fileHandle, buffer, size, transferredPtr, overlapped);
       const { count, moreData } = await this._finishOverlapped("ReadFile", ok, overlapped, transferredPtr, {
         allowMoreData: true
       });
-      return { data: buffer.subarray(0, count), moreData };
+      return { data: Buffer.from(koffi.view(buffer, count)), moreData };
     } finally {
       kernel32.CloseHandle(event);
     }
   }
 
   async _writeFile(data) {
-    const { ref, kernel32, OVERLAPPED } = this._load();
+    const { DWORD, kernel32 } = this._load();
     const buffer = Buffer.from(data);
-    const transferredPtr = ref.alloc(ref.types.uint32);
-    const overlapped = new OVERLAPPED();
+    const transferredPtr = this._allocStable(DWORD, 0);
+    const overlapped = this._allocOverlapped();
     const event = this._createEvent("WriteFile");
-    overlapped.hEvent = event;
+    this._writeOverlapped(overlapped, event);
 
     try {
-      const ok = kernel32.WriteFile(this.fileHandle, buffer, buffer.length, transferredPtr, overlapped.ref());
+      const ok = kernel32.WriteFile(this.fileHandle, buffer, buffer.length, transferredPtr, overlapped);
       const { count } = await this._finishOverlapped("WriteFile", ok, overlapped, transferredPtr);
       if (count !== buffer.length) {
         throw new Error(`WriteFile wrote ${count} of ${buffer.length} bytes`);
@@ -271,31 +277,64 @@ class RdpVirtualChannel {
   }
 
   _createEvent(operation) {
-    const { ref, kernel32 } = this._load();
-    const event = kernel32.CreateEventW(ref.NULL, 1, 0, ref.NULL);
+    const { kernel32 } = this._load();
+    const event = kernel32.CreateEventW(null, 1, 0, null);
     if (this._isNullPointer(event)) {
       throw this._lastError(`CreateEventW(${operation})`);
     }
     return event;
   }
 
+  _allocStable(type, value) {
+    const { koffi } = this._load();
+    const pointer = koffi.alloc(type, 1);
+    koffi.encode(pointer, type, value);
+    return pointer;
+  }
+
+  _allocOverlapped() {
+    const { koffi, OVERLAPPED } = this._load();
+    return koffi.alloc(OVERLAPPED, 1);
+  }
+
+  _readStable(pointer, type) {
+    const { koffi } = this._load();
+    return koffi.decode(pointer, type);
+  }
+
+  _writeOverlapped(pointer, event) {
+    const { koffi, OVERLAPPED } = this._load();
+    koffi.encode(pointer, OVERLAPPED, {
+      Internal: 0,
+      InternalHigh: 0,
+      Offset: 0,
+      OffsetHigh: 0,
+      hEvent: event
+    });
+  }
+
   async _finishOverlapped(operation, ok, overlapped, transferredPtr, { allowMoreData = false } = {}) {
-    const { kernel32 } = this._load();
+    const { DWORD, kernel32, OVERLAPPED } = this._load();
 
     if (ok) {
-      return { count: transferredPtr.deref(), moreData: false };
+      return { count: this._readStable(transferredPtr, DWORD), moreData: false };
     }
 
     const errorCode = kernel32.GetLastError();
     if (errorCode === ERROR_MORE_DATA && allowMoreData) {
-      return { count: transferredPtr.deref() || Number(overlapped.InternalHigh || 0), moreData: true };
+      const overlappedData = this._readStable(overlapped, OVERLAPPED);
+      return {
+        count: this._readStable(transferredPtr, DWORD) || Number(overlappedData.InternalHigh || 0),
+        moreData: true
+      };
     }
     if (errorCode !== ERROR_IO_PENDING) {
       throw new Error(`${operation} failed with Win32 error ${errorCode}`);
     }
 
     const waitResult = await new Promise((resolve, reject) => {
-      kernel32.WaitForSingleObject.async(overlapped.hEvent, INFINITE, (error, result) => {
+      const overlappedData = this._readStable(overlapped, OVERLAPPED);
+      kernel32.WaitForSingleObject.async(overlappedData.hEvent, INFINITE, (error, result) => {
         if (error) {
           reject(error);
           return;
@@ -311,15 +350,19 @@ class RdpVirtualChannel {
       throw new Error(`WaitForSingleObject(${operation}) returned ${waitResult}`);
     }
 
-    const completed = kernel32.GetOverlappedResult(this.fileHandle, overlapped.ref(), transferredPtr, 0);
+    const completed = kernel32.GetOverlappedResult(this.fileHandle, overlapped, transferredPtr, 0);
     if (!completed) {
       const completedError = kernel32.GetLastError();
       if (completedError === ERROR_MORE_DATA && allowMoreData) {
-        return { count: transferredPtr.deref() || Number(overlapped.InternalHigh || 0), moreData: true };
+        const overlappedData = this._readStable(overlapped, OVERLAPPED);
+        return {
+          count: this._readStable(transferredPtr, DWORD) || Number(overlappedData.InternalHigh || 0),
+          moreData: true
+        };
       }
       throw this._lastError(`GetOverlappedResult(${operation})`);
     }
-    return { count: transferredPtr.deref(), moreData: false };
+    return { count: this._readStable(transferredPtr, DWORD), moreData: false };
   }
 
   close() {
